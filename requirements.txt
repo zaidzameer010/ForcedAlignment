@@ -1,4 +1,4 @@
-faster-whisper
+numpy
 rich
 pydub
 librosa
@@ -8,3 +8,4 @@ requests
 python-dotenv
 silero-vad
 stable-ts
+uroman

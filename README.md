@@ -1,137 +1,111 @@
-# Advanced Audio Transcriber
+# ForcedAlignment.py
 
-An advanced audio transcription tool powered by Faster-Whisper (OpenAI Whisper v3 via CTranslate2) with multi-language support, accurate timestamps, and enhanced post-processing.
+A full-featured, GPU-accelerated audio/video transcription and forced alignment pipeline built on top of [stable-ts](https://github.com/jianfch/stable-ts) (Stable Whisper). It is designed to handle extremely long files reliably using Voice Activity Detection (VAD) chunking, and comes out-of-the-box with context-biasing optimized for Islamic/Urdu/Arabic lectures and scholarly content.
 
-## Features
+---
 
-- Faster-Whisper large-v3 model for state-of-the-art transcription (CTranslate2 backend)
-- Interactive CLI: pick audio from current folder and choose language (or auto-detect)
-- Robust audio pre-processing: denoise + normalization (librosa + noisereduce) with optional HPF/LPF, preemphasis, and basic dereverb (Wiener)
-- Silero VAD filtering with tunable parameters for cleaner segments
-- Word-level timestamps with punctuation-aware segmentation and RTL-friendly SRT (Urdu/Arabic)
-- Outputs: SRT, WebVTT (.vtt), and JSON with per-word confidences
-- Domain biasing: initial prompts and hotwords support
-- Auto language detection option with thresholds
-- GPU acceleration (float16 on CUDA). CPU uses int8 quantization for memory/speed
-- Optional grammar enhancement step using Gemini AI to fix punctuation/grammar in SRT
-- Optional two-pass re-decode for low-confidence segments to improve accuracy
-- Run config snapshot (.run.json) for reproducibility of parameters per run
+## Key Features
 
-## Supported Languages
+- **Dual Modes (`--mode`)**:
+  - **`align`**: Force-aligns an existing text transcript (`.txt` or `.md`) to an audio/video file.
+  - **`transcribe`**: Generates a completely new transcript from audio/video.
+- **Robust VAD Segmenting**: Uses `silero-vad` to detect natural speech boundaries and split long audio files into smaller segments (default: 5 minutes) before running Whisper. This prevents GPU memory issues, hallucination loops, and time-drift.
+- **Context-Biased Prompting**: Biases the transcription model with specialized religious prompts for Urdu and Arabic vocabulary, ensuring correct spellings of sacred names and scholarly terms (e.g., Allah, Muhammad ﷺ, Quran, Hadith, Imam Abu Hanifa, etc.).
+- **Automatic Hardware Acceleration**: Auto-detects and utilizes Apple Silicon MPS (both MLX and PyTorch versions), NVIDIA CUDA, or CPU fallback.
+- **Timestamp Refinement**: Optionally runs model-guided refinement (`--refine`) on word boundaries to ensure ultra-precise timing.
+- **Advanced Subtitle Regrouping & Splitting**: Fine-tune your output using stable-ts string DSL, character count limits, word count limits, gap duration, or punctuation markers (including Urdu `۔` and Arabic `؟`).
+- **Rich Terminal UI**: Displays progressive task progress bars, table-based statistics, and interactive file pickers when command-line arguments are omitted.
+- **Multi-Format Export**: Generates SRT, VTT, ASS, TSV, and JSON formats simultaneously with options for word-level highlights and progressive karaoke effects.
 
-- Arabic (ar)
-- Urdu (ur)
-- English (en)
-- Hindi (hi)
-- Persian (fa)
-- Turkish (tr)
-- French (fr)
-- German (de)
-- Spanish (es)
-- Italian (it)
-- Portuguese (pt)
-- Dutch (nl)
-- Russian (ru)
-- Japanese (ja)
-- Korean (ko)
-- Chinese (zh)
-- Malay (ms)
-- Bengali (bn)
-- Indonesian (id)
-- Tamil (ta)
+---
 
 ## Installation
 
-1. Install Python 3.8 or higher
-2. Install required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. (Optional) For GPU: install the matching CUDA PyTorch wheel (see comment in requirements.txt)
+### 1. Install System Dependencies
+Make sure you have `ffmpeg` installed on your system.
+- **macOS (via Homebrew)**:
+  ```bash
+  brew install ffmpeg
+  ```
+- **Ubuntu/Debian**:
+  ```bash
+  sudo apt update && sudo apt install ffmpeg
+  ```
+
+### 2. Install Python Dependencies
+Install the required python packages from `requirements.txt`:
+```bash
+pip install -r requirements.txt
+```
+
+---
 
 ## Usage
 
-Basic usage (interactive):
+You can run `ForcedAlignment.py` interactively or by passing direct CLI arguments.
+
+### 1. Interactive Mode
+If you run the script without arguments, it will automatically search your current working directory for audio/video files and transcripts, showing a interactive menu to select files:
 ```bash
-python transcribe.py
+python ForcedAlignment.py
 ```
 
-During the run you'll be prompted to:
-- Select an audio/video file from the current directory (mp3, wav, flac, mp4, m4a, aac, ogg)
-- Choose language (Urdu, Arabic, English) or Auto-detect
+### 2. Standard Command-Line Usage
 
-Outputs are written next to the selected file as `.srt`, `.vtt`, and `.json`.
-
-Grammar enhancement (optional):
+#### Transcription Mode
+Generate a transcript from an audio or video file:
 ```bash
-python grammar.py
-```
-This reads a selected `.srt`, sends just the text to Gemini for correction, and writes `<name>_enhanced.srt`.
-
-## Advanced Pre-processing (optional)
-
-The pipeline always loads mono 16 kHz audio, applies optional noise reduction and normalization. You can further tune pre-processing in `CONFIG["preprocess"]` inside `transcribe.py`:
-
-```python
-"preprocess": {
-  "denoise": True,
-  "denoise_prop_decrease": 0.8,
-  "normalize": True,
-  "highpass_hz": 50.0,   # remove low-frequency rumble
-  "lowpass_hz": null,    # e.g., 7800.0 to suppress hiss (null means disabled)
-  "preemphasis": False,
-  "preemphasis_coef": 0.97,
-  "dereverb": False,     # basic Wiener-based dereverb
-}
+python ForcedAlignment.py path/to/audio.mp3 --mode transcribe --model large-v3-turbo --language ur
 ```
 
-Notes:
-- HPF/LPF and dereverb rely on SciPy (installed via `requirements.txt`).
-- If `librosa` cannot load an input (some MP4s), the tool falls back to raw file input for Faster-Whisper.
-
-## Two-pass Low-confidence Re-decode (optional)
-
-For segments with low confidence, you can enable a second pass with higher beam size and a temperature schedule to improve accuracy:
-
-```python
-"two_pass": {
-  "enabled": true,
-  "min_mean_word_prob": 0.6,
-  "max_avg_logprob": -1.25,
-  "beam_size": 12,
-  "best_of": 5,
-  "temperature_list": [0.0, 0.2, 0.4, 0.6],
-}
+#### Forced Alignment Mode (Default)
+Align an existing text transcript file to an audio or video file:
+```bash
+python ForcedAlignment.py path/to/audio.mp3 path/to/transcript.txt --mode align
 ```
 
-How it works:
-- Computes mean per-word probability if available; otherwise uses `avg_logprob`.
-- If below the threshold, the segment is sliced from waveform and re-decoded with more exhaustive settings.
+---
 
-## Reproducibility Snapshot
+## Command Line Reference
 
-Each run writes a companion `<name>.run.json` next to outputs (controlled by `CONFIG["emit_run_config"]`). It captures:
-- Model/device/compute_type
-- VAD and decoding parameters (as actually passed to Faster-Whisper)
-- Preprocess and segmentation configs
-- Language selection and input file name
+### Input / Output Options
+*   `audio` (Positional): Path to the audio or video file.
+*   `transcript` (Positional): Path to the transcript text file (only required/prompted for `align` mode).
+*   `--mode`: `align` or `transcribe` (default: `align`).
+*   `--output-name <name>`: Custom base name for the output files (defaults to audio file name).
+*   `--output-dir <path>`: Directory where output files will be saved (defaults to working directory).
+*   `--formats <fmts>`: Comma-separated list of formats to save (options: `srt`, `vtt`, `ass`, `tsv`, `json`; default: `srt`).
 
-## Output
+### Model Options
+*   `--model <model_name>`: Stable-TS Whisper model name or HF hub path (default: `large-v3-turbo`).
+*   `--language <lang>`: Language code (e.g., `ur`, `ar`, `en`, `auto`). Default is `ur`.
+*   `--initial-prompt <prompt>`: Initial prompt to bias transcription. (Defaults to Urdu/Arabic religious prompt for `ur` or `auto` languages).
+*   `--beam-size <size>`: Beam size for transcription (default: `10`).
+*   `--temperature <temp>`: Temperature for transcription (default: `0.0`).
 
-- SRT subtitles with accurate, word-informed timestamps (punctuation-aware splitting)
-- WebVTT (.vtt) for web players
-- JSON with segments and word confidences
-- Enhanced SRT (`*_enhanced.srt`) if you run the grammar step
+### VAD & Segmenting
+*   `--segment-length <seconds>`: Length of audio segments for sequential processing (default: `300.0` or 5 minutes).
+*   `--vad-threshold <float>`: Silero-VAD threshold for detecting speech (default: `0.35`).
 
-## Requirements
+### Timestamp Refinement
+*   `--refine`: Enable post-transcription/alignment timestamp refinement using Whisper attention weights.
+*   `--refine-precision <seconds>`: Refinement step precision (default: `0.1`).
+*   `--refine-prob-threshold <float>`: Probability threshold below which to stop refinement (default: `0.5`).
 
-- Python 3.8+
-- CUDA-compatible GPU (optional, for faster processing). On CPU, int8 quantization is used
-- Minimum 8GB RAM
-- Disk space for model files (~3GB for large-v3)
+### Regrouping & Splitting (Subtitle Customization)
+*   `--regroup <dsl>`: Regroup segments using stable-ts string DSL (e.g. `da` for default algorithm, or `ms_sg=.5_mg=.15+3`).
+*   `--split-gap <seconds>`: Split segments where the gap between consecutive words exceeds this duration.
+*   `--split-chars <int>`: Split segments if their character count exceeds this limit.
+*   `--split-words <int>`: Split segments if their word count exceeds this limit.
+*   `--split-punctuation <list>`: Split segments at these punctuation marks (comma-separated, e.g. `.,?,!,۔,؟`).
 
-### Environment for Grammar Enhancement
-Create a `.env` with:
-```
-GEMINI_API_KEY=your_key
-GEMINI_MODEL=gemini-1.5-pro
+### Styling & Highlighting
+*   `--word-level`: Enable word-level timestamps/highlights in the generated subtitle files.
+*   `--no-segment-level`: Disable segment-level timestamps in the generated subtitle files.
+*   `--highlight-tag <tags>`: Wrap the active/spoken word in these tags (default: `<b>,</b>`).
+*   `--karaoke`: Use progressive filling highlight (karaoke effect) in ASS subtitle output.
+
+---
+
+## License
+This pipeline is open-source. For underlying Whisper model license details, check the [OpenAI Whisper repository](https://github.com/openai/whisper). Refer to [stable-ts](https://github.com/jianfch/stable-ts) for upstream API documentation.

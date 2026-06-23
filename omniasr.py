@@ -1,67 +1,54 @@
-from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
-from omnilingual_asr.models.wav2vec2_llama.beamsearch import (
-    Wav2Vec2LlamaBeamSearchConfig,
-)
-import argparse
-from pathlib import Path
-from typing import List, Optional, Tuple
-from rich.console import Console
-from rich.table import Table
-from rich.prompt import Prompt
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    BarColumn,
-    TaskProgressColumn,
-    TimeRemainingColumn,
-)
-from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+#!/usr/bin/env python3
+"""
+Urdu/Arabic Specific ASR Transcription Pipeline
+Using omnilingual-asr (3B CTC Model) & Silero VAD.
+"""
 
+import os
+import sys
+from pathlib import Path
+from typing import List, Dict
+
+# Verify rich installation first
+try:
+    import rich
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.prompt import Prompt
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+except ImportError:
+    print("Error: The 'rich' library is required to run this script. Please install it using: pip install rich")
+    sys.exit(1)
+
+console = Console()
+
+# Verify heavy ML libraries and handle PyTorch/TorchAudio mismatch gracefully
 try:
     import torch
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-
-SAMPLING_RATE = 16000
-
-vad_model = load_silero_vad()
-
-
-def infer_device(arg: Optional[str]) -> Optional[str]:
-    if arg is None or arg == "auto":
-        if torch is not None:
-            try:
-                if torch.cuda.is_available():  # type: ignore[union-attr]
-                    return "cuda"
-            except Exception:
-                pass
-        return "cpu"
-    return arg
-
-
-def infer_dtype(arg: Optional[str]) -> Optional["torch.dtype"]:
-    if torch is None:
-        return None
-    if arg is None or arg == "auto":
-        try:
-            if torch.cuda.is_available():  # type: ignore[union-attr]
-                return torch.bfloat16
-        except Exception:
-            return None
-        return None
-    mapping = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    return mapping.get(arg)
+    import librosa
+    import soundfile as sf
+    from silero_vad import get_speech_timestamps, load_silero_vad
+    from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
+except (ImportError, OSError) as e:
+    console.print(Panel.fit(
+        f"[bold red]Initialization Error:[/bold red]\n\n"
+        f"[yellow]{str(e)}[/yellow]\n\n"
+        f"This is typically caused by a version mismatch between [bold]torch[/bold] and [bold]torchaudio[/bold] "
+        f"in your environment (e.g. conda environment 'tts').\n\n"
+        f"Please run one of the following commands to resolve this issue:\n"
+        f"1. [bold cyan]conda install -n tts pytorch torchaudio -c pytorch[/bold cyan]\n"
+        f"2. [bold cyan]pip install --force-reinstall torch torchaudio --extra-index-url https://download.pytorch.org/whl/cpu[/bold cyan] (CPU only)\n"
+        f"3. [bold cyan]pip install --force-reinstall torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu121[/bold cyan] (GPU/CUDA)\n",
+        title="Environment Setup Check",
+        border_style="red"
+    ))
+    sys.exit(1)
 
 
 def format_srt_time(seconds: float) -> str:
-    if seconds is None:
-        seconds = 0.0
-    if seconds < 0:
+    """Format seconds into SRT timestamp string HH:MM:SS,mmm"""
+    if seconds is None or seconds < 0:
         seconds = 0.0
     total_ms = int(round(seconds * 1000.0))
     hours = total_ms // 3_600_000
@@ -73,312 +60,240 @@ def format_srt_time(seconds: float) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
 
-def build_beam_config(args) -> Optional[Wav2Vec2LlamaBeamSearchConfig]:
-    use_beam = (
-        args.beam_size is not None
-        or args.length_norm
-        or args.compression_window is not None
-        or args.compression_threshold is not None
-    )
-    if not use_beam:
-        return None
-    return Wav2Vec2LlamaBeamSearchConfig(
-        nbest=args.beam_size or 5,
-        length_norm=args.length_norm,
-        compression_window=args.compression_window or 100,
-        compression_threshold=args.compression_threshold or 4.0,
-    )
-
-
-def parse_args(argv: Optional[List[str]] = None):
-    parser = argparse.ArgumentParser(
-        prog="omniasr",
-        description="Transcribe audio files with Omnilingual-ASR",
-    )
-    parser.add_argument(
-        "audio",
-        nargs="*",
-        help="Audio files to transcribe",
-    )
-    parser.add_argument(
-        "--model-card",
-        default="omniASR_CTC_1B",
-        help="Model card name, e.g. omniASR_LLM_1B, omniASR_CTC_1B",
-    )
-    parser.add_argument(
-        "--device",
-        choices=["auto", "cpu", "cuda"],
-        default="auto",
-        help="Device to run on (auto=CUDA if available, else CPU)",
-    )
-    parser.add_argument(
-        "--dtype",
-        choices=["auto", "float32", "float16", "bfloat16"],
-        default="auto",
-        help="Computation dtype (auto picks a reasonable default)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=4,
-        help="Batch size for transcription",
-    )
-    parser.add_argument(
-        "--lang",
-        nargs="+",
-        default="urd_Arab",
-        help=(
-            "Language codes like eng_Latn; pass one code to use for all files "
-            "or one code per input file"
-        ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Directory to write transcripts to (defaults to alongside audio)",
-    )
-    parser.add_argument(
-        "--output-ext",
-        type=str,
-        default="srt",
-        help="Extension for transcript files (default: srt)",
-    )
-    parser.add_argument(
-        "--beam-size",
-        type=int,
-        default=6,
-        help="Beam size (nbest) for LLM decoding",
-    )
-    parser.add_argument(
-        "--length-norm",
-        action="store_true",
-        help="Enable length normalization in beam search",
-    )
-    parser.add_argument(
-        "--compression-window",
-        type=int,
-        default=None,
-        help="Repetition compression window size",
-    )
-    parser.add_argument(
-        "--compression-threshold",
-        type=float,
-        default=None,
-        help="Repetition compression threshold",
-    )
-    parser.add_argument(
-        "--segment-seconds",
-        type=float,
-        default=38.0,
-        help="Maximum duration per chunk in seconds",
-    )
-    return parser.parse_args(argv)
-
-
-def prepare_langs(
-    audio_paths: List[Path], langs: Optional[List[str]]
-) -> Optional[List[str]]:
-    if not langs:
-        return None
-    if len(langs) == 1:
-        return [langs[0]] * len(audio_paths)
-    if len(langs) != len(audio_paths):
-        raise SystemExit(
-            "Number of --lang codes must be 1 or equal to number of audio files"
-        )
-    return langs
-
-
 def find_audio_files() -> List[Path]:
+    """Find all audio and video files in the current working directory."""
     cwd = Path.cwd()
-    files: List[Path] = []
-    for pattern in ("*.mp3", "*.MP3", "*.mp4", "*.MP4"):
-        files.extend(cwd.glob(pattern))
-    return sorted(files, key=lambda p: p.name.lower())
+    extensions = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".mp4", ".mkv", ".avi", ".mov"}
+    found_files = []
+    for p in cwd.iterdir():
+        if p.is_file() and p.suffix.lower() in extensions:
+            found_files.append(p)
+    return sorted(found_files, key=lambda f: f.name.lower())
 
 
-def select_file(console: Console, files: List[Path]) -> Path:
+def chunk_segments(speech_timestamps: List[dict], max_duration: float = 30.0) -> List[dict]:
+    """
+    Sub-split any speech segments longer than max_duration to prevent
+    omnilingual-asr length limit errors (since models were trained on <= 30s segments).
+    """
+    chunked_segments = []
+    for ts in speech_timestamps:
+        start = float(ts['start'])
+        end = float(ts['end'])
+        duration = end - start
+        if duration <= max_duration:
+            chunked_segments.append({'start': start, 'end': end})
+        else:
+            curr = start
+            while curr < end:
+                curr_end = min(curr + max_duration, end)
+                # Avoid leaving a tiny fragment at the end
+                if end - curr_end < 2.0:
+                    curr_end = end
+                chunked_segments.append({'start': curr, 'end': curr_end})
+                curr = curr_end
+    return chunked_segments
+
+
+def main():
+    console.print(Panel(
+        "[bold green]Omnilingual ASR Transcription Pipeline[/bold green]\n"
+        "Using [bold cyan]omniASR_CTC_3B_v2[/bold cyan] for Urdu & Arabic specific speech transcription.",
+        border_style="green"
+    ))
+
+    # 1. Discover audio/video files
+    files = find_audio_files()
+    if not files:
+        console.print("[bold red]No supported audio or video files found in the current directory.[/bold red]")
+        console.print("Supported formats: .mp3, .wav, .flac, .ogg, .m4a, .aac, .mp4, .mkv, .avi, .mov")
+        return
+
+    # 2. Interactive CLI Selection
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("#", justify="right", width=4)
-    table.add_column("File", overflow="fold")
+    table.add_column("File Name", overflow="fold")
+    table.add_column("Size", justify="right", width=12)
+
     for i, f in enumerate(files, 1):
-        table.add_row(str(i), f.name)
+        size_mb = f.stat().st_size / (1024 * 1024)
+        table.add_row(str(i), f.name, f"{size_mb:.2f} MB")
+
     console.print(table)
     choices = [str(i) for i in range(1, len(files) + 1)]
-    selected = Prompt.ask("Select a file", choices=choices, default="1")
-    return files[int(selected) - 1]
+    selected_idx = Prompt.ask("Select an audio/video file to transcribe", choices=choices, default="1")
+    selected_file = files[int(selected_idx) - 1]
+    console.print(f"Selected file: [bold yellow]{selected_file.name}[/bold yellow]\n")
 
+    # 3. Interactive Device/Parameters Selection
+    device_choices = ["auto", "cuda", "mps", "cpu"]
+    selected_device = Prompt.ask("Select processing device", choices=device_choices, default="auto")
 
-def merge_segments(
-    segments: List[Tuple[int, int]],
-    max_seconds: float,
-    merge_gap_s: float = 0.4,
-) -> List[Tuple[int, int]]:
-    if not segments:
-        return []
-    segments = sorted(segments, key=lambda x: x[0])
-    max_len_samples = int(max_seconds * SAMPLING_RATE) if max_seconds > 0 else 0
-    merge_gap_samples = int(merge_gap_s * SAMPLING_RATE) if merge_gap_s > 0 else 0
-    merged: List[Tuple[int, int]] = []
-    cur_start, cur_end = segments[0]
-    for start, end in segments[1:]:
-        gap = start - cur_end
-        if (
-            merge_gap_samples
-            and gap <= merge_gap_samples
-            and (not max_len_samples or end - cur_start <= max_len_samples)
-        ):
-            cur_end = max(cur_end, end)
+    # Determine device and dtype
+    if selected_device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+            dtype = torch.bfloat16
+        elif torch.backends.mps.is_available():
+            device = "mps"
+            dtype = torch.float16
         else:
-            merged.append((cur_start, cur_end))
-            cur_start, cur_end = start, end
-    merged.append((cur_start, cur_end))
-
-    if not max_len_samples:
-        return merged
-
-    final: List[Tuple[int, int]] = []
-    for start, end in merged:
-        cur = start
-        while max_len_samples and end - cur > max_len_samples:
-            seg_end = cur + max_len_samples
-            final.append((cur, seg_end))
-            cur = seg_end
-        final.append((cur, end))
-    return final
-
-
-def transcribe_with_segments(
-    pipeline: ASRInferencePipeline,
-    path: Path,
-    lang: Optional[str],
-    batch_size: int,
-    max_seconds: float,
-    console: Console,
-) -> str:
-    wav = read_audio(str(path), sampling_rate=SAMPLING_RATE)
-    speech_timestamps = get_speech_timestamps(
-        wav,
-        vad_model,
-        threshold=0.5,
-        sampling_rate=SAMPLING_RATE,
-        min_speech_duration_ms=150,
-        min_silence_duration_ms=600,
-        speech_pad_ms=200,
-    )
-
-    segments: List[Tuple[int, int]] = []
-    if speech_timestamps:
-        for ts in speech_timestamps:
-            start = int(ts["start"])
-            end = int(ts["end"])
-            segments.append((start, end))
+            device = "cpu"
+            dtype = torch.float32
     else:
-        total = wav.shape[-1]
-        segments = [(0, int(total))]
+        device = selected_device
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    segments = merge_segments(segments, max_seconds=max_seconds, merge_gap_s=0.4)
+    # Model Card selection for quality/accuracy options
+    model_choices = ["1", "2"]
+    console.print("\n[bold magenta]Select Model Type (CTC for speed, LLM for accuracy):[/bold magenta]")
+    console.print(" 1) CTC 3B Model ([cyan]omniASR_CTC_3B_v2[/cyan]) - Fast parallel decoding, no language conditioning")
+    console.print(" 2) LLM 3B Model ([cyan]omniASR_LLM_Unlimited_3B_v2[/cyan]) - Autoregressive, supports language conditioning (Recommended for highest accuracy)")
+    selected_model_idx = Prompt.ask("Choose model option", choices=model_choices, default="2")
+    model_card = "omniASR_CTC_3B_v2" if selected_model_idx == "1" else "omniASR_LLM_Unlimited_3B_v2"
 
-    inputs = [
-        {"waveform": wav[start:end], "sample_rate": SAMPLING_RATE}
-        for (start, end) in segments
-    ]
-
-    results: List[str] = []
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        expand=True,
-    )
-    with progress:
-        task = progress.add_task(f"Transcribing {path.name}", total=len(inputs))
-        for idx in range(0, len(inputs), batch_size):
-            batch_inputs = inputs[idx : idx + batch_size]
-            if lang is not None:
-                lang_batch = [lang] * len(batch_inputs)
-            else:
-                lang_batch = None
-            texts = pipeline.transcribe(
-                batch_inputs,
-                batch_size=min(batch_size, len(batch_inputs)),
-                lang=lang_batch,
-            )
-            results.extend(texts)
-            progress.update(task, advance=len(batch_inputs))
-
-    lines: List[str] = []
-    for i, ((start, end), text) in enumerate(zip(segments, results), start=1):
-        start_sec = float(start) / SAMPLING_RATE
-        end_sec = float(end) / SAMPLING_RATE
-        lines.append(str(i))
-        lines.append(f"{format_srt_time(start_sec)} --> {format_srt_time(end_sec)}")
-        lines.append((text or "").strip())
-        lines.append("")
-    return "\n".join(lines)
-
-
-def main(argv: Optional[List[str]] = None) -> None:
-    console = Console()
-    args = parse_args(argv)
-    if args.audio:
-        audio_paths = [Path(p) for p in args.audio]
+    # Language selection for explicit Urdu/Arabic targeting (always prompted)
+    lang_choices = ["1", "2", "3"]
+    console.print("\n[bold magenta]Select Target Language (biases script accuracy for LLM model):[/bold magenta]")
+    console.print(" 1) Urdu ([cyan]urd_Arab[/cyan]) - For Urdu speech / religious lectures (handles Arabic quotes well)")
+    console.print(" 2) Arabic ([cyan]ara_Arab[/cyan]) - For pure Arabic speech / Quranic recitation")
+    console.print(" 3) Auto-detect (Let model decide)")
+    selected_lang_idx = Prompt.ask("Choose language option", choices=lang_choices, default="1")
+    
+    lang_code = None
+    if selected_lang_idx == "1":
+        selected_lang_name = "urd_Arab"
+    elif selected_lang_idx == "2":
+        selected_lang_name = "ara_Arab"
     else:
-        files = find_audio_files()
-        if not files:
-            console.print(
-                "[bold red]No .mp3 or .mp4 files found in the current directory.[/bold red]"
-            )
+        selected_lang_name = None
+
+    if model_card == "omniASR_LLM_Unlimited_3B_v2":
+        lang_code = selected_lang_name
+    elif selected_lang_name is not None:
+        console.print(f"[yellow]Note: CTC model selected. Language conditioning ({selected_lang_name}) is ignored for CTC model.[/yellow]")
+
+    batch_size_str = Prompt.ask("\nEnter batch size (larger values require more memory)", default="8")
+    try:
+        batch_size = max(1, int(batch_size_str))
+    except ValueError:
+        batch_size = 8
+
+    console.print(f"\n[bold green]Configuration Summary:[/bold green]")
+    console.print(f" - Model: [cyan]{model_card}[/cyan]")
+    console.print(f" - Target Device: [cyan]{device}[/cyan]")
+    console.print(f" - Target Precision: [cyan]{dtype}[/cyan]")
+    console.print(f" - Batch Size: [cyan]{batch_size}[/cyan]")
+    if lang_code:
+        console.print(f" - Forced Language: [cyan]{lang_code}[/cyan]")
+    else:
+        console.print(f" - Forced Language: [cyan]Auto-detect / None[/cyan]")
+    console.print("")
+
+    # 4. Load VAD Model & Segment Audio
+    with console.status("[bold blue]Loading Silero VAD model...[/bold blue]"):
+        vad_model = load_silero_vad()
+
+    with console.status(f"[bold blue]Loading and resampling audio to 16kHz...[/bold blue]"):
+        try:
+            y, sr = librosa.load(str(selected_file), sr=16000, mono=True)
+        except Exception as e:
+            console.print(f"[bold red]Failed to load audio file:[/bold red] {e}")
             return
-        target = select_file(console, files)
-        audio_paths = [target]
 
-    missing = [str(p) for p in audio_paths if not p.exists()]
-    if missing:
-        raise SystemExit(f"Missing audio files: {', '.join(missing)}")
-
-    device = infer_device(args.device)
-    dtype = infer_dtype(args.dtype)
-    beam_config = build_beam_config(args)
-
-    pipeline_kwargs = {"model_card": args.model_card}
-    if device is not None:
-        pipeline_kwargs["device"] = device
-    if dtype is not None:
-        pipeline_kwargs["dtype"] = dtype
-    if beam_config is not None:
-        pipeline_kwargs["beam_search_config"] = beam_config
-
-    pipeline = ASRInferencePipeline(**pipeline_kwargs)
-
-    langs = prepare_langs(audio_paths, args.lang)
-    max_seconds = args.segment_seconds
-
-    out_dir = Path(args.output_dir) if args.output_dir else None
-    if out_dir is not None:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    ext = "." + args.output_ext.lstrip(".")
-
-    for idx, path in enumerate(audio_paths):
-        lang = langs[idx] if langs else None
-        text = transcribe_with_segments(
-            pipeline=pipeline,
-            path=path,
-            lang=lang,
-            batch_size=args.batch_size,
-            max_seconds=max_seconds,
-            console=console,
+    with console.status("[bold blue]Detecting speech segments using VAD...[/bold blue]"):
+        wav_tensor = torch.from_numpy(y)
+        raw_segments = get_speech_timestamps(
+            wav_tensor,
+            vad_model,
+            sampling_rate=16000,
+            return_seconds=True
         )
-        if out_dir is not None:
-            out_path = out_dir / (path.stem + ext)
-        else:
-            out_path = path.with_suffix(ext)
-        out_path.write_text(text, encoding="utf-8")
-        print(str(out_path))
+
+    if not raw_segments:
+        console.print("[bold yellow]Warning: No speech segments detected by Silero VAD.[/bold yellow]")
+        console.print("Writing an empty SRT file and exiting...")
+        out_srt = selected_file.with_suffix(".srt")
+        out_srt.write_text("", encoding="utf-8")
+        return
+
+    # Sub-split long segments (>30s) to fit model sequence boundaries
+    segments = chunk_segments(raw_segments, max_duration=30.0)
+    console.print(f"Detected [bold green]{len(raw_segments)}[/bold green] raw speech segments.")
+    console.print(f"Split into [bold green]{len(segments)}[/bold green] chunks (max 30s each) for inference.\n")
+
+    # 5. Initialize omnilingual-asr Pipeline
+    with console.status(f"[bold blue]Loading {model_card} model on {device}...[/bold blue]"):
+        try:
+            pipeline = ASRInferencePipeline(
+                model_card=model_card,
+                device=device,
+                dtype=dtype
+            )
+        except Exception as e:
+            console.print(f"[bold red]Failed to load omnilingual-asr pipeline:[/bold red] {e}")
+            if device == "mps":
+                console.print("[yellow]Tip: MPS device can sometimes fail with unsupported PyTorch operators. Try running on 'cpu' or 'cuda'.[/yellow]")
+            return
+
+    # 6. Run Transcription Loop
+    transcriptions = []
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            expand=True
+        ) as progress:
+            task_id = progress.add_task(f"Transcribing {selected_file.name}", total=len(segments))
+
+            for i in range(0, len(segments), batch_size):
+                batch_segs = segments[i:i + batch_size]
+                batch_inputs = []
+
+                for seg in batch_segs:
+                    start_idx = int(seg['start'] * 16000)
+                    end_idx = int(seg['end'] * 16000)
+                    waveform = y[start_idx:end_idx]
+                    batch_inputs.append({"waveform": waveform, "sample_rate": 16000})
+
+                # Transcribe batch with optional language conditioning
+                transcribe_kwargs = {"batch_size": len(batch_inputs)}
+                if lang_code:
+                    transcribe_kwargs["lang"] = [lang_code] * len(batch_inputs)
+
+                batch_trans = pipeline.transcribe(batch_inputs, **transcribe_kwargs)
+                transcriptions.extend(batch_trans)
+                progress.update(task_id, advance=len(batch_segs))
+    except Exception as e:
+        console.print(f"[bold red]Inference error occurred during transcription:[/bold red] {e}")
+        return
+
+    # 7. Write SRT Subtitle File
+    srt_path = selected_file.with_suffix(".srt")
+    try:
+        with srt_path.open("w", encoding="utf-8") as f:
+            for idx, (seg, text) in enumerate(zip(segments, transcriptions), start=1):
+                start_str = format_srt_time(seg['start'])
+                end_str = format_srt_time(seg['end'])
+                clean_text = (text or "").strip()
+                f.write(f"{idx}\n{start_str} --> {end_str}\n{clean_text}\n\n")
+    except Exception as e:
+        console.print(f"[bold red]Failed to write SRT file:[/bold red] {e}")
+        return
+
+    console.print(Panel(
+        f"[bold green]Transcription Completed Successfully![/bold green]\n\n"
+        f" - [bold]Output SRT File:[/bold] [cyan]{srt_path.name}[/cyan]\n"
+        f" - [bold]Total SRT Entries:[/bold] {len(segments)}\n"
+        f" - [bold]Audio Duration:[/bold] {len(y)/16000:.2f} seconds\n"
+        f" - [bold]Saved in:[/bold] {srt_path.parent}",
+        border_style="green",
+        title="Success"
+    ))
 
 
 if __name__ == "__main__":
