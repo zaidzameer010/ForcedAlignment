@@ -27,11 +27,7 @@ Make sure you have `ffmpeg` installed on your system.
   ```bash
   brew install ffmpeg
   ```
-- **Ubuntu/Debian**:
-  ```bash
-  sudo apt update && sudo apt install ffmpeg
-  ```
-
+  
 ### 2. Install Python Dependencies
 Install the required python packages from `requirements.txt`:
 ```bash
